@@ -3,24 +3,53 @@ session_start();
 include '../includes/db.php'; // database connectie
 
 $error = '';
+$nameInput = '';
+$emailInput = '';
+
+// Hulpfunctie om e-maildomeinen veilig te controleren
+function emailEndsWith(string $email, string $domain): bool {
+    $domainLength = strlen($domain);
+    if ($domainLength === 0) {
+        return false;
+    }
+
+    return strlen($email) >= $domainLength && substr($email, -$domainLength) === $domain;
+}
 
 if ($_SERVER["REQUEST_METHOD"] == "POST") {
-    $name = mysqli_real_escape_string($conn, $_POST['name']);
-    $email = mysqli_real_escape_string($conn, $_POST['email']);
-    $password = password_hash($_POST['password'], PASSWORD_BCRYPT);
-    $role = mysqli_real_escape_string($conn, $_POST['role']);
+    $nameInput = trim($_POST['name'] ?? '');
+    $emailInput = trim($_POST['email'] ?? '');
+    $passwordInput = $_POST['password'] ?? '';
 
-    // Controleer of e-mail al bestaat
-    $check = mysqli_query($conn, "SELECT * FROM users WHERE email='$email'");
-    if (mysqli_num_rows($check) > 0) {
-        $error = "Er bestaat al een account met dit e-mailadres!";
+    $emailLower = strtolower($emailInput);
+    $role = '';
+
+    // Bepaal de rol op basis van het e-mailadresdomein
+    if (emailEndsWith($emailLower, '@student.gildeopleidingen.nl')) {
+        $role = 'student';
+    } elseif (emailEndsWith($emailLower, '@rocgilde.nl')) {
+        $role = 'teacher';
     } else {
-        $query = "INSERT INTO users (name, email, password, role) VALUES ('$name', '$email', '$password', '$role')";
-        if (mysqli_query($conn, $query)) {
-            header("Location: login.php");
-            exit();
+        $error = "Gebruik je school e-mailadres (@student.gildeopleidingen.nl of @rocgilde.nl) om je te registreren.";
+    }
+
+    if ($error === '') {
+        $name = mysqli_real_escape_string($conn, $nameInput);
+        $email = mysqli_real_escape_string($conn, $emailLower);
+        $password = password_hash($passwordInput, PASSWORD_BCRYPT);
+
+        // Controleer of e-mail al bestaat
+        $check = mysqli_query($conn, "SELECT id FROM users WHERE email='$email'");
+        if (mysqli_num_rows($check) > 0) {
+            $error = "Er bestaat al een account met dit e-mailadres!";
         } else {
-            $error = "Er ging iets mis bij het registreren. Probeer opnieuw.";
+            $query = "INSERT INTO users (name, email, password, role) VALUES ('$name', '$email', '$password', '$role')";
+            if (mysqli_query($conn, $query)) {
+                header("Location: login.php");
+                exit();
+            } else {
+                $error = "Er ging iets mis bij het registreren. Probeer opnieuw.";
+            }
         }
     }
 }
@@ -55,16 +84,13 @@ if ($_SERVER["REQUEST_METHOD"] == "POST") {
         <?php endif; ?>
 
         <form action="" method="POST">
-            <input type="text" name="name" placeholder="Naam" required>
-            <input type="email" name="email" placeholder="E-mailadres" required>
+            <input type="text" name="name" placeholder="Naam" value="<?php echo htmlspecialchars($nameInput ?? '', ENT_QUOTES, 'UTF-8'); ?>" required>
+            <input type="email" name="email" placeholder="E-mailadres" value="<?php echo htmlspecialchars($emailInput ?? '', ENT_QUOTES, 'UTF-8'); ?>" required>
             <input type="password" name="password" placeholder="Wachtwoord" required>
-            <select name="role" required>
-                <option value="">Selecteer rol</option>
-                <option value="student">Student</option>
-                <option value="teacher">Docent</option>
-            </select>
             <button type="submit" class="btn-primary">Account aanmaken</button>
         </form>
+
+        <p class="register-note">Gebruik je school e-mailadres eindigend op @student.gildeopleidingen.nl of @rocgilde.nl.</p>
 
         <p class="register-login">Heb je al een account? <a href="login.php">Inloggen</a></p>
     </div>

@@ -23,17 +23,6 @@ if ($role !== 'teacher') {
     exit;
 }
 
-// Zorg dat er een 'survey' skill bestaat
-$skill_id = null;
-$q = mysqli_query($conn, "SELECT id FROM skills WHERE name = 'Survey' LIMIT 1");
-if ($q && mysqli_num_rows($q) > 0) {
-    $r = mysqli_fetch_assoc($q);
-    $skill_id = $r['id'];
-} else {
-    mysqli_query($conn, "INSERT INTO skills (name, description) VALUES ('Survey','Automatisch aangemaakte skill voor enquêtes')");
-    $skill_id = mysqli_insert_id($conn);
-}
-
 // Handel POST af: opslaan van survey + vragen
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $title = trim(mysqli_real_escape_string($conn, $_POST['title'] ?? ''));
@@ -42,10 +31,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $questions = $_POST['questions'] ?? [];
     $question_types = $_POST['question_types'] ?? [];
     $options = $_POST['options'] ?? [];
+    $skill_names = $_POST['skill_names'] ?? [];
+    $skill_descriptions = $_POST['skill_descriptions'] ?? [];
 
     $errors = [];
     if ($title === '') $errors[] = 'Vul een titel in.';
     if (empty($questions)) $errors[] = 'Voeg minimaal 1 vraag toe.';
+    if (count($questions) !== count($skill_names)) $errors[] = 'Koppel voor iedere vraag een skillnaam.';
     
     // Controleer of group_id bestaat als het niet 0 is
     if ($group_id > 0) {
@@ -55,50 +47,211 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    if (empty($errors)) {
-        // Als group_id 0 is, maak dan een standaard groep aan
-        if ($group_id === 0) {
-            $default_group_name = "Algemene groep - " . date('d-m-Y H:i');
-            $stmt = mysqli_prepare($conn, "INSERT INTO `groups` (name, created_by) VALUES (?, ?)");
-            mysqli_stmt_bind_param($stmt, 'si', $default_group_name, $user_id);
-            mysqli_stmt_execute($stmt);
-            $group_id = mysqli_insert_id($conn);
-            mysqli_stmt_close($stmt);
+    // Valideer vragen en bijhorende skills
+    foreach ($questions as $idx => $rawQuestion) {
+        $qtext = trim($rawQuestion);
+        if ($qtext === '') {
+            $errors[] = 'Vraag ' . ($idx + 1) . ' heeft geen tekst.';
+            continue;
         }
-        
-        // Insert survey
-        $stmt = mysqli_prepare($conn, "INSERT INTO surveys (title, group_id, created_by, anonymous) VALUES (?, ?, ?, ?)");
-        mysqli_stmt_bind_param($stmt, 'siii', $title, $group_id, $user_id, $anonymous);
-        mysqli_stmt_execute($stmt);
-        $survey_id = mysqli_insert_id($conn);
-        mysqli_stmt_close($stmt);
 
-        // Insert questions and link to survey
-        $stmtQ = mysqli_prepare($conn, "INSERT INTO questions (skill_id, question_text, question_type, question_options) VALUES (?, ?, ?, ?)");
-        $stmtLink = mysqli_prepare($conn, "INSERT INTO survey_questions (survey_id, question_id) VALUES (?, ?)");
-        
-        foreach ($questions as $index => $qtext) {
-            $qtext = trim($qtext);
-            if ($qtext === '') continue;
-            
-            $qtype = $question_types[$index] ?? 'scale';
-            $qoptions = null;
-            
-            if ($qtype === 'choice' && isset($options[$index])) {
-                $qoptions = trim($options[$index]);
+        $skill_name = trim($skill_names[$idx] ?? '');
+        if ($skill_name === '') {
+            $errors[] = 'Vraag ' . ($idx + 1) . ' mist een skillnaam.';
+        }
+
+        $qtype = $question_types[$idx] ?? 'scale';
+        if ($qtype === 'choice') {
+            $rawOptions = $options[$idx] ?? '[]';
+            $decoded = json_decode($rawOptions, true);
+            if (!is_array($decoded)) {
+                $errors[] = 'Vraag ' . ($idx + 1) . ' heeft ongeldige meerkeuze-opties.';
+                continue;
             }
-            
-            mysqli_stmt_bind_param($stmtQ, 'isss', $skill_id, $qtext, $qtype, $qoptions);
-            mysqli_stmt_execute($stmtQ);
-            $question_id = mysqli_insert_id($conn);
-            mysqli_stmt_bind_param($stmtLink, 'ii', $survey_id, $question_id);
-            mysqli_stmt_execute($stmtLink);
+            $cleanOpts = [];
+            foreach ($decoded as $opt) {
+                $opt = trim((string)$opt);
+                if ($opt !== '') {
+                    $cleanOpts[] = $opt;
+                }
+            }
+            if (count($cleanOpts) < 2) {
+                $errors[] = 'Meerkeuzevraag ' . ($idx + 1) . ' heeft minstens twee opties nodig.';
+            }
         }
-        mysqli_stmt_close($stmtQ);
-        mysqli_stmt_close($stmtLink);
+    }
 
-        header('Location: survey.php?created=1');
-        exit;
+    if (empty($errors)) {
+        if (!mysqli_begin_transaction($conn)) {
+            $errors[] = 'Opslaan van de vragenlijst is mislukt. Probeer het opnieuw.';
+        } else {
+            $allGood = true;
+            $stmtGroup = null;
+            $stmtSurvey = null;
+            $stmtQ = null;
+            $stmtLink = null;
+            $stmtSkillSelect = null;
+            $stmtSkillInsert = null;
+
+            if ($group_id === 0) {
+                $default_group_name = "Algemene groep - " . date('d-m-Y H:i');
+                $stmtGroup = mysqli_prepare($conn, "INSERT INTO `groups` (name, created_by) VALUES (?, ?)");
+                if (!$stmtGroup) {
+                    $allGood = false;
+                } else {
+                    mysqli_stmt_bind_param($stmtGroup, 'si', $default_group_name, $user_id);
+                    if (!mysqli_stmt_execute($stmtGroup)) {
+                        $allGood = false;
+                    } else {
+                        $group_id = mysqli_insert_id($conn);
+                    }
+                }
+            }
+
+            if ($allGood) {
+                $stmtSurvey = mysqli_prepare($conn, "INSERT INTO surveys (title, group_id, created_by, anonymous) VALUES (?, ?, ?, ?)");
+                if (!$stmtSurvey) {
+                    $allGood = false;
+                } else {
+                    mysqli_stmt_bind_param($stmtSurvey, 'siii', $title, $group_id, $user_id, $anonymous);
+                    if (!mysqli_stmt_execute($stmtSurvey)) {
+                        $allGood = false;
+                    } else {
+                        $survey_id = mysqli_insert_id($conn);
+                    }
+                }
+            }
+
+            if ($stmtGroup) {
+                mysqli_stmt_close($stmtGroup);
+            }
+            if ($stmtSurvey) {
+                mysqli_stmt_close($stmtSurvey);
+            }
+
+            if ($allGood) {
+                $stmtQ = mysqli_prepare($conn, "INSERT INTO questions (skill_id, question_text, question_type, question_options) VALUES (?, ?, ?, ?)");
+                $stmtLink = mysqli_prepare($conn, "INSERT INTO survey_questions (survey_id, question_id) VALUES (?, ?)");
+                $stmtSkillSelect = mysqli_prepare($conn, "SELECT id FROM skills WHERE name = ? LIMIT 1");
+                $stmtSkillInsert = mysqli_prepare($conn, "INSERT INTO skills (name, description) VALUES (?, ?)");
+
+                if (!$stmtQ || !$stmtLink || !$stmtSkillSelect || !$stmtSkillInsert) {
+                    $allGood = false;
+                }
+            }
+
+            if ($allGood) {
+                $skillCache = [];
+
+                foreach ($questions as $index => $rawQuestion) {
+                    $qtext = trim($rawQuestion);
+                    if ($qtext === '') {
+                        continue;
+                    }
+
+                    $skillName = trim($skill_names[$index] ?? '');
+                    $skillDesc = trim($skill_descriptions[$index] ?? '');
+                    $skillKey = function_exists('mb_strtolower') ? mb_strtolower($skillName) : strtolower($skillName);
+                    $skillIdForQuestion = null;
+
+                    if ($skillName === '') {
+                        $allGood = false;
+                        break;
+                    }
+
+                    if (isset($skillCache[$skillKey])) {
+                        $skillIdForQuestion = $skillCache[$skillKey];
+                    } else {
+                        mysqli_stmt_bind_param($stmtSkillSelect, 's', $skillName);
+                        if (!mysqli_stmt_execute($stmtSkillSelect)) {
+                            $allGood = false;
+                            break;
+                        }
+                        mysqli_stmt_store_result($stmtSkillSelect);
+                        if (mysqli_stmt_num_rows($stmtSkillSelect) > 0) {
+                            $existingSkillId = null;
+                            mysqli_stmt_bind_result($stmtSkillSelect, $existingSkillId);
+                            if (mysqli_stmt_fetch($stmtSkillSelect)) {
+                                $skillIdForQuestion = (int)$existingSkillId;
+                            }
+                        }
+                        mysqli_stmt_free_result($stmtSkillSelect);
+                        mysqli_stmt_reset($stmtSkillSelect);
+
+                        if (!$skillIdForQuestion) {
+                            $desc = $skillDesc !== '' ? $skillDesc : null;
+                            mysqli_stmt_bind_param($stmtSkillInsert, 'ss', $skillName, $desc);
+                            if (!mysqli_stmt_execute($stmtSkillInsert)) {
+                                $allGood = false;
+                                break;
+                            }
+                            $skillIdForQuestion = mysqli_insert_id($conn);
+                        }
+                        $skillCache[$skillKey] = $skillIdForQuestion;
+                    }
+
+                    if (!$skillIdForQuestion) {
+                        $allGood = false;
+                        break;
+                    }
+
+                    $qtype = $question_types[$index] ?? 'scale';
+                    $qtype = in_array($qtype, ['scale','text','choice','boolean'], true) ? $qtype : 'scale';
+
+                    $optionsPayload = null;
+                    if ($qtype === 'choice') {
+                        $rawOptions = $options[$index] ?? '[]';
+                        $decoded = json_decode($rawOptions, true);
+                        $cleanOpts = [];
+                        if (is_array($decoded)) {
+                            foreach ($decoded as $opt) {
+                                $opt = trim((string)$opt);
+                                if ($opt !== '') {
+                                    $cleanOpts[] = $opt;
+                                }
+                            }
+                        }
+                        if (count($cleanOpts) < 2) {
+                            $allGood = false;
+                            break;
+                        }
+                        $optionsPayload = json_encode(array_values(array_unique($cleanOpts)));
+                    }
+
+                    mysqli_stmt_bind_param($stmtQ, 'isss', $skillIdForQuestion, $qtext, $qtype, $optionsPayload);
+                    if (!mysqli_stmt_execute($stmtQ)) {
+                        $allGood = false;
+                        break;
+                    }
+                    $question_id = mysqli_insert_id($conn);
+                    mysqli_stmt_bind_param($stmtLink, 'ii', $survey_id, $question_id);
+                    if (!mysqli_stmt_execute($stmtLink)) {
+                        $allGood = false;
+                        break;
+                    }
+                }
+            }
+
+            if ($allGood) {
+                mysqli_commit($conn);
+                if ($stmtQ) mysqli_stmt_close($stmtQ);
+                if ($stmtLink) mysqli_stmt_close($stmtLink);
+                if ($stmtSkillSelect) mysqli_stmt_close($stmtSkillSelect);
+                if ($stmtSkillInsert) mysqli_stmt_close($stmtSkillInsert);
+
+                header('Location: survey.php?created=1');
+                exit;
+            }
+
+            mysqli_rollback($conn);
+
+            if ($stmtQ) mysqli_stmt_close($stmtQ);
+            if ($stmtLink) mysqli_stmt_close($stmtLink);
+            if ($stmtSkillSelect) mysqli_stmt_close($stmtSkillSelect);
+            if ($stmtSkillInsert) mysqli_stmt_close($stmtSkillInsert);
+
+            $errors[] = 'Opslaan van de vragenlijst is mislukt. Probeer het opnieuw.';
+        }
     }
 }
 
@@ -330,6 +483,33 @@ if ($gq) {
         display: flex;
         flex-direction: column;
         gap: 1em;
+    }
+
+    .question-skill {
+        display: flex;
+        flex-direction: column;
+        gap: 0.5em;
+    }
+
+    .skill-input {
+        width: 100%;
+        padding: 0.9em 1.1em;
+        border: 1.8px solid #e6eefc;
+        border-radius: 10px;
+        font-size: 0.95em;
+        transition: all 0.3s ease;
+        background: #fff;
+    }
+
+    .skill-input:focus {
+        outline: none;
+        border-color: #0f63d4;
+        box-shadow: 0 6px 18px rgba(15,99,212,0.06);
+    }
+
+    .skill-hint {
+        font-size: 0.8em;
+        color: #6b7280;
     }
 
     .question-textarea {
@@ -794,6 +974,10 @@ function createQuestionHTML(index) {
                         <option value="choice">Meerkeuze</option>
                         <option value="boolean">Ja/Nee</option>
                     </select>
+                    <div class="question-skill">
+                        <input type="text" name="skill_names[]" class="skill-input" placeholder="Skillnaam (bijv. Samenwerken)" required>
+                        <span class="skill-hint">Deze skill verschijnt bij rapportages van deze vraag.</span>
+                    </div>
                 </div>
             </div>
             
@@ -814,7 +998,7 @@ function createQuestionHTML(index) {
                     </svg>
                     Optie toevoegen
                 </button>
-                <input type="hidden" name="options[]" class="options-hidden">
+                <input type="hidden" name="options[]" class="options-hidden" value="[]">
             </div>
             
             <div class="question-preview">
@@ -961,6 +1145,9 @@ function updateQuestionPreview(select) {
     if (type === 'choice') {
         const firstInput = optionsInput.querySelector('.option-input');
         if (firstInput) updateChoicePreview(firstInput);
+    } else {
+        const hiddenInput = optionsInput.querySelector('.options-hidden');
+        if (hiddenInput) hiddenInput.value = '[]';
     }
 }
 
@@ -981,6 +1168,19 @@ function updateQuestionNumbers() {
         const numberEl = card.querySelector('.question-number');
         if (numberEl) numberEl.textContent = index + 1;
         card.dataset.index = index;
+
+        const optionsList = card.querySelector('.options-list');
+        if (optionsList) optionsList.dataset.questionIndex = index;
+
+        card.querySelectorAll('.preview-choice-option input').forEach(radio => {
+            radio.name = `choice_preview_${index}`;
+        });
+        card.querySelectorAll('.scale-option input').forEach(radio => {
+            radio.name = `preview_${index}`;
+        });
+        card.querySelectorAll('.boolean-option input').forEach(radio => {
+            radio.name = `bool_preview_${index}`;
+        });
     });
 }
 

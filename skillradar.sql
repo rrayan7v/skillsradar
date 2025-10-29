@@ -88,6 +88,9 @@ CREATE TABLE `responses` (
   `question_id` int(11) NOT NULL,
   `user_id` int(11) DEFAULT NULL,
   `score` int(11) NOT NULL,
+  `teacher_feedback` text DEFAULT NULL,
+  `feedback_by` int(11) DEFAULT NULL,
+  `feedback_at` timestamp NULL DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
